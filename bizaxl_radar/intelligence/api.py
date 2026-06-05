@@ -5,6 +5,13 @@ All-free implementation: Overpass (OSM), Nominatim, RBI RSS, ExchangeRate API
 from __future__ import annotations
 import frappe, json, re, urllib.parse
 from typing import Optional
+from bizaxl_radar.intelligence.domain_loader import (
+    get_system_prompt_addition as _domain_prompt,
+    get_recommendations_context as _domain_reco_ctx,
+    get_domain_label as _domain_label,
+    resolve_domain_kpis as _domain_kpis,
+)
+
 try:
     import httpx
 except ImportError:
@@ -92,6 +99,24 @@ def geocode_location(query: str) -> dict:
     """Geocode a Google Maps URL or plain address. Called from the setup modal."""
     if not query or not query.strip():
         return {"ok": False, "error": "Empty query"}
+
+    q = query.strip()
+
+    # Expand short URLs: maps.app.goo.gl/... or goo.gl/...
+    if httpx and ("goo.gl" in q or "maps.app" in q):
+        try:
+            with httpx.Client(
+                timeout=12,
+                follow_redirects=True,
+                max_redirects=8,
+                headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+            ) as client:
+                r = client.get(q)
+                q = str(r.url)   # now the full maps.google.com URL with @lat,lng
+        except Exception as e:
+            frappe.log_error(str(e), "RADAR Short URL Expand")
+
+    query = q  # use expanded URL from here
 
     # Try URL first
     lat, lng = _extract_coords_from_url(query)
@@ -409,3 +434,346 @@ Write a concise intelligence report (max 180 words):
 
     narrative = _call_groq([{"role":"user","content":"Generate my weekly business intelligence report."}], system)
     return {"narrative": narrative, "benchmark": bench, "competitor_count": comp_count}
+
+@frappe.whitelist()
+def get_chart_data() -> dict:
+    """
+    Returns data for all four RADAR analytics charts:
+      - monthly_revenue   : last 12 months of BA Sales Invoice totals
+      - top_products      : top 8 products by revenue (current year)
+      - customer_activity : unique customers per month (last 6 months)
+      - yoy_comparison    : this year vs last year by month
+    All monetary values are rounded to 0 decimal places.
+    Missing months are filled with 0 so charts never look broken.
+    """
+
+    # ── Monthly revenue — last 12 months ──────────────────────────────────────
+    try:
+        monthly_rows = frappe.db.sql("""
+            SELECT
+                DATE_FORMAT(posting_date, '%b %Y')  AS label,
+                DATE_FORMAT(posting_date, '%Y-%m')  AS sort_key,
+                COALESCE(SUM(grand_total), 0)          AS value
+            FROM `tabBA Sales Invoice`
+            WHERE posting_date >= DATE_SUB(CURDATE(), INTERVAL 11 MONTH)
+              AND status != 'Cancelled'
+            GROUP BY DATE_FORMAT(posting_date, '%Y-%m')
+            ORDER BY sort_key
+        """, as_dict=True)
+        monthly_revenue = [
+            {"label": r.label, "value": float(r.value or 0)} for r in monthly_rows
+        ]
+    except Exception as e:
+        frappe.log_error(str(e)[:200], "radar_chart:monthly_revenue")
+        monthly_revenue = []
+
+    # ── Top 8 products by revenue — current year ──────────────────────────────
+    try:
+        product_rows = frappe.db.sql("""
+            SELECT
+                sii.item_code                   AS label,
+                COALESCE(SUM(sii.amount), 0)    AS value
+            FROM `tabBA Sales Invoice Item` sii
+            INNER JOIN `tabBA Sales Invoice` si
+                ON si.name = sii.parent
+            WHERE si.status != 'Cancelled'
+              AND YEAR(si.posting_date) = YEAR(CURDATE())
+            GROUP BY sii.item_code
+            ORDER BY value DESC
+            LIMIT 8
+        """, as_dict=True)
+        top_products = [
+            {"label": (r.label or "Unknown")[:22], "value": float(r.value or 0)}
+            for r in product_rows
+        ]
+    except Exception as e:
+        frappe.log_error(str(e)[:200], "radar_chart:top_products")
+        top_products = []
+
+    # ── Customer activity — unique customers per month (last 6 months) ─────────
+    try:
+        cust_rows = frappe.db.sql("""
+            SELECT
+                DATE_FORMAT(posting_date, '%b')      AS label,
+                DATE_FORMAT(posting_date, '%Y-%m')  AS sort_key,
+                COUNT(DISTINCT customer)               AS value
+            FROM `tabBA Sales Invoice`
+            WHERE posting_date >= DATE_SUB(CURDATE(), INTERVAL 5 MONTH)
+              AND status != 'Cancelled'
+            GROUP BY DATE_FORMAT(posting_date, '%Y-%m')
+            ORDER BY sort_key
+        """, as_dict=True)
+        customer_activity = [
+            {"label": r.label, "value": int(r.value or 0)} for r in cust_rows
+        ]
+    except Exception as e:
+        frappe.log_error(str(e)[:200], "radar_chart:customer_activity")
+        customer_activity = []
+
+    # ── Year-over-year — this year vs last year by month ──────────────────────
+    try:
+        yoy_rows = frappe.db.sql("""
+            SELECT
+                YEAR(posting_date)                    AS yr,
+                MONTH(posting_date)                   AS mn,
+                DATE_FORMAT(posting_date, '%b')      AS month_label,
+                COALESCE(SUM(grand_total), 0)         AS value
+            FROM `tabBA Sales Invoice`
+            WHERE YEAR(posting_date) IN (YEAR(CURDATE()), YEAR(CURDATE()) - 1)
+              AND status != 'Cancelled'
+            GROUP BY YEAR(posting_date), MONTH(posting_date)
+            ORDER BY YEAR(posting_date), MONTH(posting_date)
+        """, as_dict=True)
+
+        import datetime
+        this_year = datetime.date.today().year
+        months = ["Jan","Feb","Mar","Apr","May","Jun",
+                  "Jul","Aug","Sep","Oct","Nov","Dec"]
+        cy, ly = {}, {}
+        for r in yoy_rows:
+            key = int(r.mn) - 1  # 0-indexed
+            if int(r.yr) == this_year:
+                cy[key] = float(r.value or 0)
+            else:
+                ly[key] = float(r.value or 0)
+
+        yoy = {
+            "labels":    months,
+            "this_year": [cy.get(i, 0) for i in range(12)],
+            "last_year": [ly.get(i, 0) for i in range(12)],
+            "this_label": str(this_year),
+            "last_label": str(this_year - 1),
+        }
+    except Exception as e:
+        frappe.log_error(str(e)[:200], "radar_chart:yoy")
+        yoy = {"labels": [], "this_year": [], "last_year": [], "this_label": "", "last_label": ""}
+
+    return {
+        "monthly_revenue":   monthly_revenue,
+        "top_products":      top_products,
+        "customer_activity": customer_activity,
+        "yoy":               yoy,
+    }
+
+@frappe.whitelist()
+def get_customer_health() -> dict:
+    """
+    RFM (Recency, Frequency, Monetary) scoring for every customer
+    who has had at least one invoice.
+
+    Recency  — days since last invoice (lower = better)
+    Frequency — number of invoices in last 90 days
+    Monetary  — total revenue in last 90 days
+
+    Each dimension scored 1-5. Combined score 1-15.
+    Segments:
+      12-15 → Champion
+       9-11 → Loyal
+       6-8  → At Risk
+       1-5  → Lost / Dormant
+    """
+    try:
+        rows = frappe.db.sql("""
+            SELECT
+                customer,
+                MAX(posting_date)                          AS last_order,
+                DATEDIFF(CURDATE(), MAX(posting_date))     AS recency_days,
+                COUNT(CASE WHEN posting_date >= DATE_SUB(CURDATE(), INTERVAL 90 DAY)
+                           THEN 1 END)                     AS freq_90,
+                COALESCE(SUM(CASE WHEN posting_date >= DATE_SUB(CURDATE(), INTERVAL 90 DAY)
+                           THEN grand_total END), 0)       AS monetary_90,
+                COALESCE(SUM(grand_total), 0)              AS total_revenue,
+                COUNT(*)                                   AS total_orders
+            FROM `tabBA Sales Invoice`
+            WHERE status != 'Cancelled'
+            GROUP BY customer
+            ORDER BY monetary_90 DESC
+        """, as_dict=True)
+    except Exception as e:
+        frappe.log_error(str(e)[:200], "customer_health_query")
+        return {"error": str(e)[:200], "customers": [], "summary": {}}
+
+    if not rows:
+        return {"customers": [], "summary": {}}
+
+    # Compute RFM scores
+    recencies  = [float(r.recency_days or 0)  for r in rows]
+    freqs      = [float(r.freq_90 or 0)       for r in rows]
+    monetaries = [float(r.monetary_90 or 0)   for r in rows]
+
+    def score5(val, values, reverse=False):
+        """Score a value 1-5 relative to the distribution."""
+        if max(values) == min(values):
+            return 3
+        pct = (val - min(values)) / (max(values) - min(values))
+        s = int(pct * 4) + 1  # 1-5
+        return (6 - s) if reverse else s  # reverse for recency (lower days = better)
+
+    customers = []
+    seg_counts = {"Champion": 0, "Loyal": 0, "At Risk": 0, "Dormant": 0}
+
+    for r in rows:
+        r_score = score5(float(r.recency_days  or 0), recencies,  reverse=True)
+        f_score = score5(float(r.freq_90       or 0), freqs)
+        m_score = score5(float(r.monetary_90   or 0), monetaries)
+        total   = r_score + f_score + m_score  # 3-15
+
+        if total >= 12:
+            segment = "Champion"
+            color   = "#00e5a0"
+        elif total >= 9:
+            segment = "Loyal"
+            color   = "#818cf8"
+        elif total >= 6:
+            segment = "At Risk"
+            color   = "#f59e0b"
+        else:
+            segment = "Dormant"
+            color   = "#ef4444"
+
+        seg_counts[segment] += 1
+        customers.append({
+            "customer":      r.customer,
+            "recency_days":  int(r.recency_days or 0),
+            "freq_90":       int(r.freq_90 or 0),
+            "monetary_90":   float(r.monetary_90 or 0),
+            "total_revenue": float(r.total_revenue or 0),
+            "rfm_score":     total,
+            "segment":       segment,
+            "color":         color,
+            "last_order":    str(r.last_order or ""),
+        })
+
+    # Churn risk: At Risk customers sorted by monetary value
+    churn_risk = sorted(
+        [c for c in customers if c["segment"] == "At Risk"],
+        key=lambda x: x["monetary_90"], reverse=True
+    )[:5]
+
+    return {
+        "customers":   customers[:20],
+        "churn_risk":  churn_risk,
+        "seg_counts":  seg_counts,
+        "total":       len(customers),
+    }
+
+
+@frappe.whitelist()
+def get_cash_conversion() -> dict:
+    """
+    Cash Conversion Cycle and runway metrics:
+
+    Days Sales Outstanding (DSO)
+      = (Outstanding receivables / Revenue last 30d) * 30
+      How long on average before an invoice becomes cash.
+
+    Cash Runway
+      = Cash-equivalent (collected this month) / avg monthly expenses
+      Months of operation at current burn rate.
+
+    Collection velocity trend
+      = Average days to payment for invoices paid in last 3 months
+        broken down by month — is it getting faster or slower?
+
+    Outstanding aging buckets
+      = How much is 0-30, 31-60, 61-90, 90+ days overdue
+    """
+
+    # ── DSO ────────────────────────────────────────────────────────────────────
+    try:
+        rev_30 = frappe.db.sql("""
+            SELECT COALESCE(SUM(grand_total), 0) as val
+            FROM `tabBA Sales Invoice`
+            WHERE posting_date >= DATE_SUB(CURDATE(), INTERVAL 30 DAY)
+              AND status != 'Cancelled'
+        """)[0][0] or 0
+
+        outstanding = frappe.db.sql("""
+            SELECT COALESCE(SUM(outstanding_amount), 0) as val
+            FROM `tabBA Sales Invoice`
+            WHERE status NOT IN ('Cancelled', 'Paid')
+              AND outstanding_amount > 0
+        """)[0][0] or 0
+
+        dso = round((float(outstanding) / float(rev_30) * 30), 1) if rev_30 > 0 else 0
+    except Exception as e:
+        frappe.log_error(str(e)[:150], "cash_conv:dso")
+        dso, outstanding, rev_30 = 0, 0, 0
+
+    # ── Aging buckets ──────────────────────────────────────────────────────────
+    try:
+        aging_rows = frappe.db.sql("""
+            SELECT
+                SUM(CASE WHEN DATEDIFF(CURDATE(), due_date) BETWEEN 0  AND 30  THEN outstanding_amount ELSE 0 END) as b0_30,
+                SUM(CASE WHEN DATEDIFF(CURDATE(), due_date) BETWEEN 31 AND 60  THEN outstanding_amount ELSE 0 END) as b31_60,
+                SUM(CASE WHEN DATEDIFF(CURDATE(), due_date) BETWEEN 61 AND 90  THEN outstanding_amount ELSE 0 END) as b61_90,
+                SUM(CASE WHEN DATEDIFF(CURDATE(), due_date) > 90               THEN outstanding_amount ELSE 0 END) as b90plus
+            FROM `tabBA Sales Invoice`
+            WHERE status NOT IN ('Cancelled', 'Paid')
+              AND outstanding_amount > 0
+              AND due_date IS NOT NULL
+        """, as_dict=True)[0]
+        aging = {
+            "0-30 days":  float(aging_rows.b0_30   or 0),
+            "31-60 days": float(aging_rows.b31_60  or 0),
+            "61-90 days": float(aging_rows.b61_90  or 0),
+            "90+ days":   float(aging_rows.b90plus or 0),
+        }
+    except Exception as e:
+        frappe.log_error(str(e)[:150], "cash_conv:aging")
+        aging = {"0-30 days": 0, "31-60 days": 0, "61-90 days": 0, "90+ days": 0}
+
+    # ── Collection velocity trend (last 3 months) ──────────────────────────────
+    try:
+        vel_rows = frappe.db.sql("""
+            SELECT
+                DATE_FORMAT(posting_date, '%b %Y')  AS month_label,
+                DATE_FORMAT(posting_date, '%Y-%m')  AS sort_key,
+                ROUND(AVG(
+                    DATEDIFF(
+                        COALESCE(modified, posting_date),
+                        posting_date
+                    )
+                ), 1)                               AS avg_days_to_collect
+            FROM `tabBA Sales Invoice`
+            WHERE status = 'Paid'
+              AND posting_date >= DATE_SUB(CURDATE(), INTERVAL 3 MONTH)
+            GROUP BY DATE_FORMAT(posting_date, '%Y-%m')
+            ORDER BY sort_key
+        """, as_dict=True)
+        velocity = [
+            {"label": r.month_label, "days": float(r.avg_days_to_collect or 0)}
+            for r in vel_rows
+        ]
+    except Exception as e:
+        frappe.log_error(str(e)[:150], "cash_conv:velocity")
+        velocity = []
+
+    # ── Revenue collected this month ───────────────────────────────────────────
+    try:
+        collected_mtd = frappe.db.sql("""
+            SELECT COALESCE(SUM(grand_total - outstanding_amount), 0)
+            FROM `tabBA Sales Invoice`
+            WHERE MONTH(posting_date) = MONTH(CURDATE())
+              AND YEAR(posting_date)  = YEAR(CURDATE())
+              AND status != 'Cancelled'
+        """)[0][0] or 0
+    except Exception:
+        collected_mtd = 0
+
+    # Risk flag
+    overdue_critical = aging.get("61-90 days", 0) + aging.get("90+ days", 0)
+    total_aging_sum  = sum(aging.values())
+    risk_pct = round(overdue_critical / total_aging_sum * 100, 1) if total_aging_sum > 0 else 0
+
+    return {
+        "dso":              dso,
+        "outstanding":      float(outstanding),
+        "rev_30d":          float(rev_30),
+        "collected_mtd":    float(collected_mtd),
+        "aging":            aging,
+        "velocity":         velocity,
+        "risk_pct":         risk_pct,
+        "overdue_critical": float(overdue_critical),
+        "dso_status":       "good" if dso < 30 else ("warning" if dso < 60 else "critical"),
+    }

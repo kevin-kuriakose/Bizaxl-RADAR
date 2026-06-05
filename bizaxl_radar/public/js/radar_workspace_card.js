@@ -12,16 +12,23 @@ frappe.provide("bizaxl.radar");
 bizaxl.radar.WorkspaceCard = {
 
     init: function () {
+        // Remove card when navigating away (SPA cleanup)
+        var _old = document.getElementById("ba-radar-card");
+        if (_old && _old.parentNode) _old.parentNode.removeChild(_old);
+
         // Only run on the RADAR workspace
         if (!window.location.pathname.startsWith("/app/radar")) return;
 
         // Wait for workspace content to mount, then inject
         frappe.after_ajax(function () {
+
+
             bizaxl.radar.WorkspaceCard._tryInject(0);
         });
     },
 
     _tryInject: function (attempts) {
+        if (!window.location.pathname.startsWith("/app/radar")) return;
         var self = bizaxl.radar.WorkspaceCard;
         var container = document.querySelector(".layout-main-section");
         if (!container) {
@@ -239,6 +246,7 @@ bizaxl.radar.WorkspaceCard = {
 
 // Auto-init on page change (Frappe SPA router)
 $(document).on("page-change", function () {
+
     bizaxl.radar.WorkspaceCard.init();
 });
 

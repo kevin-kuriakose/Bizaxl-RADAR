@@ -45,3 +45,14 @@ frappe.pages["bizaxl-radar"].on_page_load = function(wrapper) {
         }
     });
 };
+
+// ── Ensure Frappe always shows this page when routed to it ──────────────────
+frappe.pages['bizaxl-radar'].on_page_show = function() {
+    var pg = frappe.pages['bizaxl-radar'];
+    if (pg) pg.style.display = 'block';
+    // Re-load KPIs on every visit
+    if (typeof loadKPIs === 'function') loadKPIs();
+    if (typeof rdLoadCharts === 'function' && !document.getElementById('rd-analytics')) {
+        setTimeout(rdLoadCharts, 600);
+    }
+};

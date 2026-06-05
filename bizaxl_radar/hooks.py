@@ -4,7 +4,10 @@ app_publisher = "BizAxl"
 app_description = "Vertical reporting, a deterministic NL assistant, and an alert layer for Frappe/ERPNext."
 app_email = "dev@bizaxl.example"
 app_license = "mit"
-app_include_js = ["/assets/bizaxl_radar/js/radar_workspace_card.js"]
+app_include_js = [
+    "/assets/bizaxl_radar/js/radar_workspace_card.js",
+    "/assets/bizaxl_radar/js/radar_charts.js",
+]
 
 after_install = "bizaxl_radar.install.after_install"
 

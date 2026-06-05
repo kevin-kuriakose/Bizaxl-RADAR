@@ -698,6 +698,7 @@ frappe.pages["bizaxl-radar"].on_page_load = function (wrapper) {
 		</div>
 	</div>
 	<div class="rh-right">
+		<button class="rd-settings-btn" id="rd-settings-btn" title="Edit Business Profile">⚙</button>
 		<div class="rh-live">
 			<div class="live-ring"></div>
 			Live
@@ -1250,7 +1251,9 @@ frappe.pages["bizaxl-radar"].on_page_load = function (wrapper) {
         var ov = document.getElementById("rd-setup-overlay");
         if (!ov) return;
         ov.style.display = "flex";
-        if (!isEdit) {
+        var _sb = document.getElementById("rd-setup-save-btn"); if (_sb) { _sb.disabled = true; _sb.textContent = "Save & Load Intelligence →"; }
+        // Wire handlers on every open (not just first-time)
+        {
             // Wire inputs
             var _nameEl = document.getElementById("rd-biz-name");
             var _catEl  = document.getElementById("rd-biz-category");
